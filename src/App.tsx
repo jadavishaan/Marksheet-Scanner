@@ -214,30 +214,33 @@ export default function App() {
       
       try {
         // Attempt to parse out structured API errors (like 429 Quota)
-        if (typeof errorMsg === 'string' && errorMsg.includes('{')) {
-          const jsonMatch = errorMsg.match(/\{.*\}/);
-          if (jsonMatch) {
-            const apiErr = JSON.parse(jsonMatch[0]);
-            if (apiErr.error?.code === 429 || apiErr.error?.status === 'RESOURCE_EXHAUSTED') {
-              const innerMsg = apiErr.error?.message?.toLowerCase() || "";
-              const isDaily = innerMsg.includes('daily') || innerMsg.includes('day');
-              
-              if (isDaily) {
-                errorMsg = "Daily API Quota Exhausted. You have reached the limit for today (20 requests per project). Please try again tomorrow or use a different API key.";
-                setRetryAfter(null); // No use in counting down for a daily limit
+        // Use s flag for dotAll to handle multi-line JSON strings
+        const jsonMatch = typeof errorMsg === 'string' ? errorMsg.match(/\{.*?\}/s) : null;
+        
+        if (jsonMatch) {
+          const apiErr = JSON.parse(jsonMatch[0]);
+          if (apiErr.error?.code === 429 || apiErr.error?.status === 'RESOURCE_EXHAUSTED' || apiErr.error?.message?.toLowerCase().includes('quota')) {
+            const innerMsg = apiErr.error?.message?.toLowerCase() || "";
+            const isDaily = innerMsg.includes('daily') || innerMsg.includes('day') || innerMsg.includes('project');
+            
+            if (isDaily) {
+              errorMsg = "Daily API Quota Exhausted. You have reached the limit for today (20 requests per project). Please try again tomorrow or use a different API key.";
+              setRetryAfter(null);
+            } else {
+              errorMsg = "API Rate Limit reached. Please wait a moment and try again.";
+              const delay = apiErr.error?.details?.find((d: any) => d.retryDelay)?.retryDelay;
+              if (delay) {
+                const seconds = parseInt(delay.replace('s', ''));
+                if (!isNaN(seconds)) setRetryAfter(seconds);
               } else {
-                errorMsg = "API Rate Limit reached. Please wait a moment and try again.";
-                // Look for retry delay
-                const delay = apiErr.error?.details?.find((d: any) => d.retryDelay)?.retryDelay;
-                if (delay) {
-                  const seconds = parseInt(delay.replace('s', ''));
-                  if (!isNaN(seconds)) setRetryAfter(seconds);
-                } else {
-                  setRetryAfter(10); // Default fallback
-                }
+                setRetryAfter(10);
               }
             }
           }
+        } else if (typeof errorMsg === 'string' && (errorMsg.toLowerCase().includes('quota') || errorMsg.toLowerCase().includes('exhausted'))) {
+          // Fallback if JSON parsing fails but error contains quota keywords
+          errorMsg = "API Quota/Rate Limit reached. The Gemini API Free Tier has strict limits. Please wait a moment and try again.";
+          setRetryAfter(15);
         }
       } catch (pErr) {
         console.error("Error parsing API error", pErr);
@@ -498,9 +501,21 @@ export default function App() {
                       <AlertCircle size={24} />
                     </div>
                     <div>
-                       <h3 className="text-red-900 font-medium mb-1">Could not extract data</h3>
+                       <h3 className="text-red-900 font-medium mb-1">Processing Error</h3>
                        <p className="text-red-700 text-sm max-w-md">{error}</p>
                     </div>
+                    
+                    {error.includes('Quota') && (
+                      <div className="bg-white/50 border border-red-100 rounded-xl p-4 text-left max-w-md">
+                        <h4 className="text-xs font-bold text-red-900 uppercase tracking-wider mb-2">Why is this happening?</h4>
+                        <ul className="text-[11px] text-red-800 space-y-1 list-disc pl-4">
+                          <li>The **Free Tier** of the Gemini API limits requests to **20 per project per day**.</li>
+                          <li>Batching multiple files counts towards this daily limit.</li>
+                          <li>If you see "Daily Quota Exhausted," most projects reset around midnight Pacific Time.</li>
+                        </ul>
+                      </div>
+                    )}
+
                     <button 
                       disabled={retryAfter !== null}
                       onClick={() => files.length > 0 && processFiles(files)}
