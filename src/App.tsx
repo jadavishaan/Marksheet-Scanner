@@ -36,9 +36,22 @@ export default function App() {
   const [numPages, setNumPages] = useState<number | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [retryAfter, setRetryAfter] = useState<number | null>(null);
   const [data, setData] = useState<StudentData[] | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (retryAfter !== null && retryAfter > 0) {
+      timer = setTimeout(() => {
+        setRetryAfter(retryAfter - 1);
+      }, 1000);
+    } else if (retryAfter === 0) {
+      setRetryAfter(null);
+    }
+    return () => clearTimeout(timer);
+  }, [retryAfter]);
 
   const applyMathRules = (student: StudentData): StudentData => {
     let calcObtained = 0;
@@ -114,6 +127,7 @@ export default function App() {
     let allExtracted: StudentData[] = [];
 
     try {
+      setRetryAfter(null);
       for (const file of newFiles) {
         let base64Clean: string;
         let mimeType: string;
@@ -183,7 +197,32 @@ export default function App() {
       
     } catch (err: any) {
       console.error(err);
-      setError(err.message || "Failed to process the files. Please ensure they are marksheets.");
+      let errorMsg = err.message || "Failed to process the files. Please ensure they are marksheets.";
+      
+      try {
+        // Attempt to parse out structured API errors (like 429 Quota)
+        if (typeof errorMsg === 'string' && errorMsg.includes('{')) {
+          const jsonMatch = errorMsg.match(/\{.*\}/);
+          if (jsonMatch) {
+            const apiErr = JSON.parse(jsonMatch[0]);
+            if (apiErr.error?.code === 429 || apiErr.error?.status === 'RESOURCE_EXHAUSTED') {
+              errorMsg = "API Quota Exceeded (Free Tier limit reached). Please wait a moment and try again.";
+              // Look for retry delay
+              const delay = apiErr.error?.details?.find((d: any) => d.retryDelay)?.retryDelay;
+              if (delay) {
+                const seconds = parseInt(delay.replace('s', ''));
+                if (!isNaN(seconds)) setRetryAfter(seconds);
+              } else {
+                setRetryAfter(10); // Default fallback
+              }
+            }
+          }
+        }
+      } catch (pErr) {
+        console.error("Error parsing API error", pErr);
+      }
+
+      setError(errorMsg);
     } finally {
       setIsProcessing(false);
     }
@@ -412,10 +451,15 @@ export default function App() {
                      <p className="text-red-700 text-sm max-w-md">{error}</p>
                   </div>
                   <button 
+                    disabled={retryAfter !== null}
                     onClick={() => files.length > 0 && processFiles(files)}
-                    className="px-4 py-2 bg-red-100 hover:bg-red-200 text-red-700 font-medium rounded-lg text-sm transition-colors mt-2"
+                    className={`px-4 py-2 font-medium rounded-lg text-sm transition-colors mt-2 ${
+                      retryAfter !== null 
+                      ? 'bg-zinc-100 text-zinc-400 cursor-not-allowed' 
+                      : 'bg-red-100 hover:bg-red-200 text-red-700'
+                    }`}
                   >
-                    Try Again
+                    {retryAfter !== null ? `Retry in ${retryAfter}s...` : 'Try Again'}
                   </button>
                 </div>
               )}
