@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useRef } from 'react';
-import { UploadCloud, FileImage, Loader2, Table as TableIcon, AlertCircle, Download, ZoomIn, ZoomOut, Maximize, CheckCircle2 } from 'lucide-react';
+import { UploadCloud, FileImage, Loader2, Table as TableIcon, AlertCircle, Download, ZoomIn, ZoomOut, Maximize, CheckCircle2, ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react';
 import { GoogleGenAI, Type } from '@google/genai';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
@@ -17,7 +17,7 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 interface SubjectGrade {
   subjectName: string;
   subjectCode?: string;
-  grade: string;
+  obtained: string;
 }
 
 interface StudentData {
@@ -41,6 +41,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [retryAfter, setRetryAfter] = useState<number | null>(null);
   const [data, setData] = useState<StudentData[] | null>(null);
+  const [subjectMaxMarks, setSubjectMaxMarks] = useState<Record<string, string>>({});
+  const [sortConfig, setSortConfig] = useState<{ key: string; direction: 'asc' | 'desc' } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -56,42 +58,58 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [retryAfter]);
 
-  const applyMathRules = (student: StudentData): StudentData => {
+  const applyMathRules = (student: StudentData, maxMarksMap: Record<string, string>): StudentData => {
     let calcObtained = 0;
     let calcMax = 0;
     let validMath = false;
 
+    // 1. Try to calculate from individual subjects
     student.subjects?.forEach(sub => {
-       if (!sub.grade) return;
-       const parts = sub.grade.split('/');
-       if (parts.length >= 2) {
-          const obtained = parseFloat(parts[0].replace(/[^\d.]/g, ''));
-          const max = parseFloat(parts[1].replace(/[^\d.]/g, ''));
-          if (!isNaN(obtained) && !isNaN(max)) {
-             calcObtained += obtained;
-             calcMax += max;
+       if (!sub.obtained) return;
+       const obtainedValue = parseFloat(sub.obtained.replace(/[^\d.]/g, ''));
+       // Default to "100" if no max mark is found in the map
+       const maxStr = maxMarksMap[sub.subjectName] || "100";
+       const maxValue = parseFloat(maxStr.replace(/[^\d.]/g, ''));
+       
+       if (!isNaN(obtainedValue)) {
+          calcObtained += obtainedValue;
+          if (!isNaN(maxValue)) {
+             calcMax += maxValue;
              validMath = true;
           }
        }
     });
 
+    // 2. Fallback check for Total Marks formatting if subject math is incomplete
+    if (!validMath || calcMax === 0) {
+      if (student.totalMarksObtained && student.totalMarksObtained.includes('/')) {
+        const parts = student.totalMarksObtained.split('/');
+        const rawObtained = parseFloat(parts[0].replace(/[^\d.]/g, ''));
+        const rawMax = parseFloat(parts[1].replace(/[^\d.]/g, ''));
+        if (!isNaN(rawObtained) && !isNaN(rawMax)) {
+          calcObtained = rawObtained;
+          calcMax = rawMax;
+          validMath = true;
+        }
+      }
+    }
+
     let currentPercent: number | null = null;
 
     if (validMath && calcMax > 0) {
-      // Overwrite totals entirely if we have valid math from subjects
       student.totalMarksObtained = `${calcObtained}/${calcMax}`;
       const computedPercent = (calcObtained / calcMax) * 100;
       student.percentage = `${computedPercent.toFixed(2)}%`;
       currentPercent = computedPercent;
     } else {
-      // Fallback to what was passed down initially if there's no math to compute from
+      // If we still don't have a valid percentage from math, try to parse what AI gave us
       if (student.percentage) {
         currentPercent = parseFloat(student.percentage.replace(/[^\d.]/g, ''));
       }
     }
 
     if (currentPercent !== null && !isNaN(currentPercent)) {
-      student.result = currentPercent > 35 ? 'Pass' : 'Fail';
+      student.result = currentPercent >= 35 ? 'Pass' : 'Fail';
     }
     
     return student;
@@ -130,6 +148,7 @@ export default function App() {
     setProcessingStatus(`Initializing...`);
 
     let allExtracted: StudentData[] = [];
+    const internalMaxMarks = { ...subjectMaxMarks };
 
     try {
       setRetryAfter(null);
@@ -161,7 +180,7 @@ export default function App() {
                 mimeType: mimeType
               }
             },
-            "Carefully analyze this document, which may contain one or multiple marksheets or report cards. Extract the following information for EACH student found: 'studentName', 'rollNumber' (or student ID), 'yearOfExam' (only the year, e.g. '2023'), 'stateBoard' (educational board or institution name), 'totalMarksObtained' (sum across all subjects, strictly in 'Obtained / Max Marks' format), 'percentage', and 'result' (e.g. Pass/Fail). Also extract their specific 'subjects', capturing the 'subjectCode' if available and the exact grade/mark for each subject strictly in the format 'Marks Obtained / Max Marks' (e.g., '45/50'). Organise everything so that each student represents a JSON object inside an array. Do not invent data. Try to normalize subject names slightly if they clearly refer to the same thing."
+            "Carefully analyze this document, which may contain one or multiple marksheets or report cards. Extract the following information for EACH student found: 'studentName', 'rollNumber', 'yearOfExam' (EXTRACT ONLY THE 4-DIGIT YEAR, e.g., '2023'. Ignore months, days, or full dates), 'stateBoard', 'totalMarksObtained' (obtained/max), 'percentage', and 'result'. For each specific 'subject', capture the 'subjectName', 'subjectCode', the 'obtained' marks, and the 'max' marks (maximum possible for that subject). Assume 'max' is '100' if not explicitly stated on the document. Organise everything as a JSON array of student objects. Do not invent data."
           ],
           config: {
             responseMimeType: "application/json",
@@ -171,21 +190,21 @@ export default function App() {
                 type: Type.OBJECT,
                 properties: {
                   studentName: { type: Type.STRING, description: "The full name of the student" },
-                  rollNumber: { type: Type.STRING, description: "Student roll number, ID, or registration number" },
-                  yearOfExam: { type: Type.STRING, description: "Year of the exam (e.g. 2023)" },
-                  stateBoard: { type: Type.STRING, description: "State Board or educational board name" },
-                  totalMarksObtained: { type: Type.STRING, description: "Total overall marks or sum of marks obtained" },
-                  percentage: { type: Type.STRING, description: "Final percentage calculated" },
-                  result: { type: Type.STRING, description: "Final result, e.g. Pass, Fail, Promoted" },
+                  rollNumber: { type: Type.STRING, description: "Student roll number or ID" },
+                  yearOfExam: { type: Type.STRING, description: "ONLY the 4-digit year of the exam (e.g., '2024'). DO NOT include months or full dates." },
+                  stateBoard: { type: Type.STRING, description: "The name of the educational board or institution" },
+                  totalMarksObtained: { type: Type.STRING, description: "Total marks in 'obtained/max' format" },
+                  percentage: { type: Type.STRING, description: "Final percentage (e.g. '85%')" },
+                  result: { type: Type.STRING, description: "Final result (e.g. Pass/Fail)" },
                   subjects: {
                     type: Type.ARRAY,
-                    description: "The list of subjects and grades for this student",
                     items: {
                       type: Type.OBJECT,
                       properties: {
-                        subjectName: { type: Type.STRING, description: "Name of the subject" },
-                        subjectCode: { type: Type.STRING, description: "Code of the subject if listed (e.g. CS101)" },
-                        grade: { type: Type.STRING, description: "Grade or score achieved, strictly in the format of 'Marks Obtained / Max Marks'" }
+                        subjectName: { type: Type.STRING },
+                        subjectCode: { type: Type.STRING },
+                        obtained: { type: Type.STRING },
+                        max: { type: Type.STRING }
                       }
                     }
                   }
@@ -197,14 +216,31 @@ export default function App() {
         
         const responseText = response.text;
         if (responseText) {
-          const parsedData: StudentData[] = JSON.parse(responseText);
+          const parsedData: any[] = JSON.parse(responseText);
+          
+          parsedData.forEach(student => {
+            student.subjects?.forEach((sub: any) => {
+              if (sub.max && !internalMaxMarks[sub.subjectName]) {
+                internalMaxMarks[sub.subjectName] = sub.max;
+              }
+            });
+          });
+          
           allExtracted = [...allExtracted, ...parsedData];
         }
         setProgress(Math.round((count / newFiles.length) * 100));
       }
       
+      setSubjectMaxMarks(internalMaxMarks);
       setProcessingStatus("Finalizing data...");
-      const formalizedData = allExtracted.map(student => applyMathRules(student));
+      const formalizedData = allExtracted.map(student => {
+        // Cleanup year: Extract only the 4-digit year if the AI included a full date or month
+        if (student.yearOfExam) {
+          const yearMatch = student.yearOfExam.match(/\d{4}/);
+          if (yearMatch) student.yearOfExam = yearMatch[0];
+        }
+        return applyMathRules(student, internalMaxMarks);
+      });
       setData(formalizedData);
       setProgress(100);
       
@@ -256,7 +292,7 @@ export default function App() {
     if (!data) return;
     const newData = [...data];
     newData[studentIdx] = { ...newData[studentIdx], [field]: value };
-    newData[studentIdx] = applyMathRules(newData[studentIdx]);
+    newData[studentIdx] = applyMathRules(newData[studentIdx], subjectMaxMarks);
     setData(newData);
   };
 
@@ -268,14 +304,24 @@ export default function App() {
     
     const subIdx = subjects.findIndex(s => s.subjectName === subjectName);
     if (subIdx >= 0) {
-      subjects[subIdx] = { ...subjects[subIdx], grade: value };
+      subjects[subIdx] = { ...subjects[subIdx], obtained: value };
     } else {
-      subjects.push({ subjectName, grade: value });
+      subjects.push({ subjectName, obtained: value });
     }
     
     student.subjects = subjects;
-    newData[studentIdx] = applyMathRules(student);
+    newData[studentIdx] = applyMathRules(student, subjectMaxMarks);
     setData(newData);
+  };
+
+  const handleMaxMarkChange = (subjectName: string, value: string) => {
+    const newMaxMarks = { ...subjectMaxMarks, [subjectName]: value };
+    setSubjectMaxMarks(newMaxMarks);
+    
+    if (data) {
+      const newData = data.map(student => applyMathRules(student, newMaxMarks));
+      setData(newData);
+    }
   };
 
   const allSubjects: string[] = Array.from(
@@ -293,15 +339,64 @@ export default function App() {
     });
   }
 
+  const requestSort = (key: string) => {
+    let direction: 'asc' | 'desc' = 'asc';
+    if (sortConfig && sortConfig.key === key && sortConfig.direction === 'asc') {
+      direction = 'desc';
+    }
+    setSortConfig({ key, direction });
+  };
+
+  const getSortValue = (student: StudentData, key: string) => {
+    if (key.startsWith('subject:')) {
+      const subjectName = key.replace('subject:', '');
+      const gradeObj = student.subjects?.find(s => s.subjectName === subjectName);
+      if (!gradeObj) return -1;
+      const val = parseFloat(gradeObj.obtained.replace(/[^\d.]/g, ''));
+      return isNaN(val) ? -1 : val;
+    }
+    
+    const val = (student as any)[key];
+    if (key === 'percentage') return parseFloat(val?.replace(/[^\d.]/g, '') || '0');
+    if (key === 'totalMarksObtained') {
+      const parts = val?.split('/');
+      return parts ? parseFloat(parts[0].replace(/[^\d.]/g, '')) || 0 : 0;
+    }
+    return (val || '').toString().toLowerCase();
+  };
+
+  const sortedData = React.useMemo(() => {
+    if (!data) return null;
+    let items = [...data];
+    if (sortConfig !== null) {
+      items.sort((a, b) => {
+        const aVal = getSortValue(a, sortConfig.key);
+        const bVal = getSortValue(b, sortConfig.key);
+        if (aVal < bVal) return sortConfig.direction === 'asc' ? -1 : 1;
+        if (aVal > bVal) return sortConfig.direction === 'asc' ? 1 : -1;
+        return 0;
+      });
+    }
+    return items;
+  }, [data, sortConfig]);
+
+  const SortIcon = ({ columnKey }: { columnKey: string }) => {
+    if (!sortConfig || sortConfig.key !== columnKey) return <ChevronsUpDown size={12} className="text-zinc-300 ml-1 shrink-0" />;
+    return sortConfig.direction === 'asc' 
+      ? <ChevronUp size={12} className="text-blue-600 ml-1 shrink-0" /> 
+      : <ChevronDown size={12} className="text-blue-600 ml-1 shrink-0" />;
+  };
+
   const exportToCSV = () => {
-    if (!data) return;
+    const csvData = sortedData || data;
+    if (!csvData) return;
     const headers = [
       'Student Name', 'Roll Number', 'Year', 'State Board', 
       ...allSubjects.map(s => subjectCodes[s] ? `${s} (${subjectCodes[s]})` : s), 
       'Total Marks', 'Percentage', 'Result'
     ];
     const rows: string[][] = [headers];
-    data.forEach(student => {
+    csvData.forEach(student => {
       const row: string[] = [
         student.studentName || '',
         student.rollNumber || '',
@@ -310,7 +405,7 @@ export default function App() {
       ];
       allSubjects.forEach(subject => {
          const gradeObj = student.subjects?.find(s => s.subjectName === subject);
-         row.push(gradeObj ? gradeObj.grade : '');
+         row.push(gradeObj ? gradeObj.obtained : '');
       });
       row.push(student.totalMarksObtained || '');
       row.push(student.percentage || '');
@@ -566,14 +661,41 @@ export default function App() {
                     <div className="overflow-x-auto">
                       <table className="w-full text-left border-collapse min-w-[600px]">
                         <thead>
-                          <tr className="bg-zinc-50 border-b border-zinc-200 text-xs uppercase tracking-wider text-zinc-500 font-medium">
-                            <th className="py-3 px-5 border-r border-zinc-200 min-w-48 sticky left-0 bg-zinc-50 shadow-[1px_0_0_0_rgb(228_228_231)] z-10">Student Name</th>
-                            <th className="py-3 px-5 whitespace-nowrap">Roll Number</th>
-                            <th className="py-3 px-5 whitespace-nowrap">Year</th>
-                            <th className="py-3 px-5 whitespace-nowrap min-w-48">State Board</th>
+                          <tr className="bg-zinc-50 border-b border-zinc-200 text-xs uppercase tracking-wider text-zinc-500 font-medium select-none">
+                            <th 
+                              className="py-3 px-5 border-r border-zinc-200 min-w-48 sticky left-0 bg-zinc-50 shadow-[1px_0_0_0_rgb(228_228_231)] z-10 cursor-pointer hover:text-blue-600 transition-colors"
+                              onClick={() => requestSort('studentName')}
+                            >
+                              <div className="flex items-center">Student Name <SortIcon columnKey="studentName" /></div>
+                            </th>
+                            <th 
+                              className="py-3 px-5 whitespace-nowrap cursor-pointer hover:text-blue-600 transition-colors"
+                              onClick={() => requestSort('rollNumber')}
+                            >
+                              <div className="flex items-center">Roll Number <SortIcon columnKey="rollNumber" /></div>
+                            </th>
+                            <th 
+                              className="py-3 px-5 whitespace-nowrap cursor-pointer hover:text-blue-600 transition-colors"
+                              onClick={() => requestSort('yearOfExam')}
+                            >
+                              <div className="flex items-center">Year <SortIcon columnKey="yearOfExam" /></div>
+                            </th>
+                            <th 
+                              className="py-3 px-5 whitespace-nowrap min-w-48 cursor-pointer hover:text-blue-600 transition-colors"
+                              onClick={() => requestSort('stateBoard')}
+                            >
+                              <div className="flex items-center">State Board <SortIcon columnKey="stateBoard" /></div>
+                            </th>
                             {allSubjects.map((subject, idx) => (
-                              <th key={idx} className="py-3 px-5 whitespace-nowrap">
-                                <div>{subject}</div>
+                              <th 
+                                key={idx} 
+                                className="py-3 px-5 whitespace-nowrap cursor-pointer hover:text-blue-600 transition-colors"
+                                onClick={() => requestSort(`subject:${subject}`)}
+                              >
+                                <div className="flex items-center flex-wrap">
+                                  <span>{subject}</span>
+                                  <SortIcon columnKey={`subject:${subject}`} />
+                                </div>
                                 {subjectCodes[subject] && (
                                   <div className="text-[10px] text-zinc-400 normal-case tracking-normal mt-0.5">
                                     {subjectCodes[subject]}
@@ -581,13 +703,51 @@ export default function App() {
                                 )}
                               </th>
                             ))}
-                            <th className="py-3 px-5 whitespace-nowrap">Total Marks</th>
-                            <th className="py-3 px-5 whitespace-nowrap">Percentage</th>
-                            <th className="py-3 px-5 whitespace-nowrap">Result</th>
+                            <th 
+                              className="py-3 px-5 whitespace-nowrap cursor-pointer hover:text-blue-600 transition-colors"
+                              onClick={() => requestSort('totalMarksObtained')}
+                            >
+                              <div className="flex items-center">Total Marks <SortIcon columnKey="totalMarksObtained" /></div>
+                            </th>
+                            <th 
+                              className="py-3 px-5 whitespace-nowrap cursor-pointer hover:text-blue-600 transition-colors"
+                              onClick={() => requestSort('percentage')}
+                            >
+                              <div className="flex items-center">Percentage <SortIcon columnKey="percentage" /></div>
+                            </th>
+                            <th 
+                              className="py-3 px-5 whitespace-nowrap cursor-pointer hover:text-blue-600 transition-colors"
+                              onClick={() => requestSort('result')}
+                            >
+                              <div className="flex items-center">Result <SortIcon columnKey="result" /></div>
+                            </th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-zinc-100 text-sm">
-                           {data.map((student, idx) => (
+                           {/* Add Max Marks row at the top of results */}
+                           <tr className="bg-zinc-50/80 font-medium">
+                              <td className="py-3 px-5 border-r border-zinc-100 sticky left-0 bg-zinc-50/80 shadow-[1px_0_0_0_rgb(244_244_245)] z-10 text-zinc-500 text-[10px] uppercase tracking-wider italic">
+                                Marks Out Of / Max Marks
+                              </td>
+                              <td className="p-3"></td>
+                              <td className="p-3"></td>
+                              <td className="p-3"></td>
+                              {allSubjects.map((subject, subIdx) => (
+                                <td key={`max_${subIdx}`} className="p-0">
+                                  <div className="h-full w-full py-2 px-3">
+                                    <input 
+                                      value={subjectMaxMarks[subject] || ''}
+                                      onChange={(e) => handleMaxMarkChange(subject, e.target.value)}
+                                      placeholder="Set Max"
+                                      className="w-full min-w-[80px] py-1 px-2 rounded bg-white text-zinc-900 border border-zinc-200 font-bold focus:border-blue-500 focus:ring-4 focus:ring-blue-100 outline-none transition-all text-center placeholder:font-normal placeholder:italic text-xs"
+                                    />
+                                  </div>
+                                </td>
+                              ))}
+                              <td colSpan={3} className="bg-zinc-100/30"></td>
+                           </tr>
+
+                           {(sortedData || data).map((student, idx) => (
                             <tr key={idx} className="hover:bg-zinc-50/50 transition-colors group">
                               <td className="p-0 border-r border-zinc-100 sticky left-0 bg-white shadow-[1px_0_0_0_rgb(244_244_245)] z-10">
                                 <input 
@@ -627,7 +787,7 @@ export default function App() {
                                   <td key={subIdx} className="p-0">
                                     <div className="h-full w-full py-2 px-3">
                                       <input 
-                                        value={gradeObj?.grade || ''}
+                                        value={gradeObj?.obtained || ''}
                                         onChange={(e) => handleSubjectChange(idx, subject, e.target.value)}
                                         placeholder="-"
                                         className="w-full min-w-[80px] py-1 px-2 rounded bg-zinc-100 text-zinc-900 border-[1.5px] border-transparent font-medium focus:border-blue-500 focus:bg-white focus:ring-4 focus:ring-blue-100 outline-none transition-all text-center"
