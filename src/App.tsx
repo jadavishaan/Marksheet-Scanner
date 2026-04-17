@@ -153,7 +153,7 @@ export default function App() {
         }
         
         const response = await ai.models.generateContent({
-          model: "gemini-3-flash-preview",
+          model: "gemini-3.1-flash-lite-preview",
           contents: [
             {
               inlineData: {
@@ -219,14 +219,22 @@ export default function App() {
           if (jsonMatch) {
             const apiErr = JSON.parse(jsonMatch[0]);
             if (apiErr.error?.code === 429 || apiErr.error?.status === 'RESOURCE_EXHAUSTED') {
-              errorMsg = "API Quota Exceeded (Free Tier limit reached). Please wait a moment and try again.";
-              // Look for retry delay
-              const delay = apiErr.error?.details?.find((d: any) => d.retryDelay)?.retryDelay;
-              if (delay) {
-                const seconds = parseInt(delay.replace('s', ''));
-                if (!isNaN(seconds)) setRetryAfter(seconds);
+              const innerMsg = apiErr.error?.message?.toLowerCase() || "";
+              const isDaily = innerMsg.includes('daily') || innerMsg.includes('day');
+              
+              if (isDaily) {
+                errorMsg = "Daily API Quota Exhausted. You have reached the limit for today (20 requests per project). Please try again tomorrow or use a different API key.";
+                setRetryAfter(null); // No use in counting down for a daily limit
               } else {
-                setRetryAfter(10); // Default fallback
+                errorMsg = "API Rate Limit reached. Please wait a moment and try again.";
+                // Look for retry delay
+                const delay = apiErr.error?.details?.find((d: any) => d.retryDelay)?.retryDelay;
+                if (delay) {
+                  const seconds = parseInt(delay.replace('s', ''));
+                  if (!isNaN(seconds)) setRetryAfter(seconds);
+                } else {
+                  setRetryAfter(10); // Default fallback
+                }
               }
             }
           }
