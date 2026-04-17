@@ -4,10 +4,11 @@
  */
 
 import React, { useState, useRef } from 'react';
-import { UploadCloud, FileImage, Loader2, Table as TableIcon, AlertCircle, Download, ZoomIn, ZoomOut, Maximize } from 'lucide-react';
+import { UploadCloud, FileImage, Loader2, Table as TableIcon, AlertCircle, Download, ZoomIn, ZoomOut, Maximize, CheckCircle2 } from 'lucide-react';
 import { GoogleGenAI, Type } from '@google/genai';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
+import { motion, AnimatePresence } from "motion/react";
 
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
@@ -35,6 +36,8 @@ export default function App() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [numPages, setNumPages] = useState<number | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [processingStatus, setProcessingStatus] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [retryAfter, setRetryAfter] = useState<number | null>(null);
   const [data, setData] = useState<StudentData[] | null>(null);
@@ -123,12 +126,19 @@ export default function App() {
     setError(null);
     setData(null);
     setIsProcessing(true);
+    setProgress(0);
+    setProcessingStatus(`Initializing...`);
 
     let allExtracted: StudentData[] = [];
 
     try {
       setRetryAfter(null);
+      let count = 0;
       for (const file of newFiles) {
+        count++;
+        setProcessingStatus(`Processing file ${count} of ${newFiles.length}: ${file.name}`);
+        setProgress(Math.round(((count - 0.5) / newFiles.length) * 100));
+        
         let base64Clean: string;
         let mimeType: string;
 
@@ -143,7 +153,7 @@ export default function App() {
         }
         
         const response = await ai.models.generateContent({
-          model: "gemini-3-flash-preview",
+          model: "gemini-2.0-flash",
           contents: [
             {
               inlineData: {
@@ -190,10 +200,13 @@ export default function App() {
           const parsedData: StudentData[] = JSON.parse(responseText);
           allExtracted = [...allExtracted, ...parsedData];
         }
+        setProgress(Math.round((count / newFiles.length) * 100));
       }
       
+      setProcessingStatus("Finalizing data...");
       const formalizedData = allExtracted.map(student => applyMathRules(student));
       setData(formalizedData);
+      setProgress(100);
       
     } catch (err: any) {
       console.error(err);
@@ -433,39 +446,74 @@ export default function App() {
             </div>
 
             <div className="lg:col-span-8">
-              {isProcessing && (
-                <div className="bg-white rounded-2xl border border-zinc-200 border-dashed p-16 flex flex-col items-center justify-center text-center space-y-4 h-full min-h-[400px]">
-                  <Loader2 size={32} className="animate-spin text-blue-600" />
-                  <p className="text-zinc-600 font-medium">Scanning marksheet & extracting grades...</p>
-                  <p className="text-sm text-zinc-400 max-w-sm">This can take a few moments depending on the complexity of the marksheet.</p>
-                </div>
-              )}
-
-              {error && (
-                <div className="bg-red-50 border border-red-200 rounded-2xl p-6 flex flex-col items-center justify-center space-y-4 text-center">
-                  <div className="w-12 h-12 bg-red-100 text-red-600 rounded-full flex items-center justify-center">
-                    <AlertCircle size={24} />
-                  </div>
-                  <div>
-                     <h3 className="text-red-900 font-medium mb-1">Could not extract data</h3>
-                     <p className="text-red-700 text-sm max-w-md">{error}</p>
-                  </div>
-                  <button 
-                    disabled={retryAfter !== null}
-                    onClick={() => files.length > 0 && processFiles(files)}
-                    className={`px-4 py-2 font-medium rounded-lg text-sm transition-colors mt-2 ${
-                      retryAfter !== null 
-                      ? 'bg-zinc-100 text-zinc-400 cursor-not-allowed' 
-                      : 'bg-red-100 hover:bg-red-200 text-red-700'
-                    }`}
+              <AnimatePresence mode="wait">
+                {isProcessing && (
+                  <motion.div 
+                    key="processing"
+                    initial={{ opacity: 0, scale: 0.98 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.98 }}
+                    className="bg-white rounded-2xl border border-zinc-200 border-dashed p-10 flex flex-col items-center justify-center text-center space-y-6 h-full min-h-[400px]"
                   >
-                    {retryAfter !== null ? `Retry in ${retryAfter}s...` : 'Try Again'}
-                  </button>
-                </div>
-              )}
+                    <div className="relative">
+                      <Loader2 size={48} className="animate-spin text-blue-600" />
+                      <div className="absolute inset-0 flex items-center justify-center">
+                         <span className="text-[10px] font-bold text-blue-700">{progress}%</span>
+                      </div>
+                    </div>
+                    
+                    <div className="space-y-4 w-full max-w-sm">
+                      <div className="space-y-1">
+                        <p className="text-zinc-900 font-semibold text-sm">{processingStatus}</p>
+                        <div className="h-2 w-full bg-zinc-100 rounded-full overflow-hidden">
+                           <motion.div 
+                             className="h-full bg-blue-600"
+                             initial={{ width: 0 }}
+                             animate={{ width: `${progress}%` }}
+                             transition={{ duration: 0.3 }}
+                           />
+                        </div>
+                      </div>
+                      <p className="text-xs text-zinc-400">Scanning marksheet & extracting grades. This can take a few moments depending on the complexity.</p>
+                    </div>
+                  </motion.div>
+                )}
 
-              {data && (
-                <div className="bg-white rounded-2xl border border-zinc-200 shadow-sm overflow-hidden">
+                {error && !isProcessing && (
+                  <motion.div 
+                    key="error"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="bg-red-50 border border-red-200 rounded-2xl p-6 flex flex-col items-center justify-center space-y-4 text-center"
+                  >
+                    <div className="w-12 h-12 bg-red-100 text-red-600 rounded-full flex items-center justify-center">
+                      <AlertCircle size={24} />
+                    </div>
+                    <div>
+                       <h3 className="text-red-900 font-medium mb-1">Could not extract data</h3>
+                       <p className="text-red-700 text-sm max-w-md">{error}</p>
+                    </div>
+                    <button 
+                      disabled={retryAfter !== null}
+                      onClick={() => files.length > 0 && processFiles(files)}
+                      className={`px-4 py-2 font-medium rounded-lg text-sm transition-colors mt-2 ${
+                        retryAfter !== null 
+                        ? 'bg-zinc-100 text-zinc-400 cursor-not-allowed' 
+                        : 'bg-red-100 hover:bg-red-200 text-red-700'
+                      }`}
+                    >
+                      {retryAfter !== null ? `Retry in ${retryAfter}s...` : 'Try Again'}
+                    </button>
+                  </motion.div>
+                )}
+
+                {data && !isProcessing && (
+                  <motion.div 
+                    key="results"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="bg-white rounded-2xl border border-zinc-200 shadow-sm overflow-hidden"
+                  >
                   <div className="p-5 border-b border-zinc-100 flex items-center justify-between flex-wrap gap-4">
                      <div className="flex items-center gap-3">
                        <h3 className="font-semibold text-zinc-900 flex items-center gap-2">
@@ -607,11 +655,12 @@ export default function App() {
                       </table>
                     </div>
                   )}
-                </div>
+                </motion.div>
               )}
-            </div>
+            </AnimatePresence>
           </div>
-        )}
+        </div>
+      )}
       </main>
     </div>
   );
