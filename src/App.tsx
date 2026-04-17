@@ -1,0 +1,634 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useRef } from 'react';
+import { UploadCloud, FileImage, Loader2, Table as TableIcon, AlertCircle, Download, ZoomIn, ZoomOut, Maximize } from 'lucide-react';
+import { GoogleGenAI, Type } from '@google/genai';
+import { Document, Page, pdfjs } from 'react-pdf';
+import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
+
+pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+interface SubjectGrade {
+  subjectName: string;
+  subjectCode?: string;
+  grade: string;
+}
+
+interface StudentData {
+  studentName: string;
+  rollNumber?: string;
+  yearOfExam?: string;
+  stateBoard?: string;
+  subjects: SubjectGrade[];
+  totalMarksObtained?: string;
+  percentage?: string;
+  result?: string;
+}
+
+export default function App() {
+  const [files, setFiles] = useState<File[]>([]);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [numPages, setNumPages] = useState<number | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [data, setData] = useState<StudentData[] | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const applyMathRules = (student: StudentData): StudentData => {
+    let calcObtained = 0;
+    let calcMax = 0;
+    let validMath = false;
+
+    student.subjects?.forEach(sub => {
+       if (!sub.grade) return;
+       const parts = sub.grade.split('/');
+       if (parts.length >= 2) {
+          const obtained = parseFloat(parts[0].replace(/[^\d.]/g, ''));
+          const max = parseFloat(parts[1].replace(/[^\d.]/g, ''));
+          if (!isNaN(obtained) && !isNaN(max)) {
+             calcObtained += obtained;
+             calcMax += max;
+             validMath = true;
+          }
+       }
+    });
+
+    let currentPercent: number | null = null;
+
+    if (validMath && calcMax > 0) {
+      // Overwrite totals entirely if we have valid math from subjects
+      student.totalMarksObtained = `${calcObtained}/${calcMax}`;
+      const computedPercent = (calcObtained / calcMax) * 100;
+      student.percentage = `${computedPercent.toFixed(2)}%`;
+      currentPercent = computedPercent;
+    } else {
+      // Fallback to what was passed down initially if there's no math to compute from
+      if (student.percentage) {
+        currentPercent = parseFloat(student.percentage.replace(/[^\d.]/g, ''));
+      }
+    }
+
+    if (currentPercent !== null && !isNaN(currentPercent)) {
+      student.result = currentPercent > 35 ? 'Pass' : 'Fail';
+    }
+    
+    return student;
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(e.target.files || []) as File[];
+    if (selectedFiles.length > 0) {
+      processFiles(selectedFiles);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    const droppedFiles = Array.from(e.dataTransfer.files || []) as File[];
+    const filtered = droppedFiles.filter(
+      file => file.type.startsWith('image/') || file.type === 'application/pdf'
+    );
+    if (filtered.length > 0) {
+      processFiles(filtered);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+  };
+
+  const processFiles = async (newFiles: File[]) => {
+    setFiles(newFiles);
+    setPreviewUrl(URL.createObjectURL(newFiles[0]));
+    setNumPages(null);
+    setError(null);
+    setData(null);
+    setIsProcessing(true);
+
+    let allExtracted: StudentData[] = [];
+
+    try {
+      for (const file of newFiles) {
+        let base64Clean: string;
+        let mimeType: string;
+
+        if (file.type === 'application/pdf') {
+          const base64Data = await fileToBase64(file);
+          base64Clean = base64Data.split(',')[1];
+          mimeType = 'application/pdf';
+        } else {
+          const compressedImageBase64 = await preprocessImage(file);
+          base64Clean = compressedImageBase64.split(',')[1];
+          mimeType = compressedImageBase64.split(';')[0].split(':')[1] || file.type;
+        }
+        
+        const response = await ai.models.generateContent({
+          model: "gemini-3.1-pro-preview",
+          contents: [
+            {
+              inlineData: {
+                data: base64Clean,
+                mimeType: mimeType
+              }
+            },
+            "Carefully analyze this document, which may contain one or multiple marksheets or report cards. Extract the following information for EACH student found: 'studentName', 'rollNumber' (or student ID), 'yearOfExam' (only the year, e.g. '2023'), 'stateBoard' (educational board or institution name), 'totalMarksObtained' (sum across all subjects, strictly in 'Obtained / Max Marks' format), 'percentage', and 'result' (e.g. Pass/Fail). Also extract their specific 'subjects', capturing the 'subjectCode' if available and the exact grade/mark for each subject strictly in the format 'Marks Obtained / Max Marks' (e.g., '45/50'). Organise everything so that each student represents a JSON object inside an array. Do not invent data. Try to normalize subject names slightly if they clearly refer to the same thing."
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  studentName: { type: Type.STRING, description: "The full name of the student" },
+                  rollNumber: { type: Type.STRING, description: "Student roll number, ID, or registration number" },
+                  yearOfExam: { type: Type.STRING, description: "Year of the exam (e.g. 2023)" },
+                  stateBoard: { type: Type.STRING, description: "State Board or educational board name" },
+                  totalMarksObtained: { type: Type.STRING, description: "Total overall marks or sum of marks obtained" },
+                  percentage: { type: Type.STRING, description: "Final percentage calculated" },
+                  result: { type: Type.STRING, description: "Final result, e.g. Pass, Fail, Promoted" },
+                  subjects: {
+                    type: Type.ARRAY,
+                    description: "The list of subjects and grades for this student",
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        subjectName: { type: Type.STRING, description: "Name of the subject" },
+                        subjectCode: { type: Type.STRING, description: "Code of the subject if listed (e.g. CS101)" },
+                        grade: { type: Type.STRING, description: "Grade or score achieved, strictly in the format of 'Marks Obtained / Max Marks'" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        });
+        
+        const responseText = response.text;
+        if (responseText) {
+          const parsedData: StudentData[] = JSON.parse(responseText);
+          allExtracted = [...allExtracted, ...parsedData];
+        }
+      }
+      
+      const formalizedData = allExtracted.map(student => applyMathRules(student));
+      setData(formalizedData);
+      
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || "Failed to process the files. Please ensure they are marksheets.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleCellChange = (studentIdx: number, field: keyof StudentData, value: string) => {
+    if (!data) return;
+    const newData = [...data];
+    newData[studentIdx] = { ...newData[studentIdx], [field]: value };
+    newData[studentIdx] = applyMathRules(newData[studentIdx]);
+    setData(newData);
+  };
+
+  const handleSubjectChange = (studentIdx: number, subjectName: string, value: string) => {
+    if (!data) return;
+    const newData = [...data];
+    const student = { ...newData[studentIdx] };
+    const subjects = [...(student.subjects || [])];
+    
+    const subIdx = subjects.findIndex(s => s.subjectName === subjectName);
+    if (subIdx >= 0) {
+      subjects[subIdx] = { ...subjects[subIdx], grade: value };
+    } else {
+      subjects.push({ subjectName, grade: value });
+    }
+    
+    student.subjects = subjects;
+    newData[studentIdx] = applyMathRules(student);
+    setData(newData);
+  };
+
+  const allSubjects: string[] = Array.from(
+    new Set(data?.flatMap(s => s.subjects?.map(sub => sub.subjectName) || []) || [])
+  ) as string[];
+
+  const subjectCodes: Record<string, string> = {};
+  if (data) {
+    data.forEach(student => {
+      student.subjects?.forEach(sub => {
+        if (sub.subjectCode && !subjectCodes[sub.subjectName]) {
+          subjectCodes[sub.subjectName] = sub.subjectCode;
+        }
+      });
+    });
+  }
+
+  const exportToCSV = () => {
+    if (!data) return;
+    const headers = [
+      'Student Name', 'Roll Number', 'Year', 'State Board', 
+      ...allSubjects.map(s => subjectCodes[s] ? `${s} (${subjectCodes[s]})` : s), 
+      'Total Marks', 'Percentage', 'Result'
+    ];
+    const rows: string[][] = [headers];
+    data.forEach(student => {
+      const row: string[] = [
+        student.studentName || '',
+        student.rollNumber || '',
+        student.yearOfExam || '',
+        student.stateBoard || ''
+      ];
+      allSubjects.forEach(subject => {
+         const gradeObj = student.subjects?.find(s => s.subjectName === subject);
+         row.push(gradeObj ? gradeObj.grade : '');
+      });
+      row.push(student.totalMarksObtained || '');
+      row.push(student.percentage || '');
+      row.push(student.result || '');
+
+      rows.push(row);
+    });
+    
+    const csvContent = rows.map(e => e.map(item => `"${(item || '').replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", "extracted_grades.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  return (
+    <div className="min-h-screen bg-zinc-50 font-sans text-zinc-900 pb-20">
+      <header className="bg-white border-b border-zinc-200 sticky top-0 z-10">
+        <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center">
+              <TableIcon size={18} />
+            </div>
+            <h1 className="text-xl font-semibold tracking-tight">Grade2<span className="text-blue-600">Data</span></h1>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-6 mt-12 space-y-12">
+        <div className="max-w-2xl mx-auto text-center space-y-4">
+          <h2 className="text-4xl font-semibold tracking-tight text-zinc-900">
+            Automatic Marksheet Scanning System
+          </h2>
+          <p className="text-lg text-zinc-600">
+            Upload an image or PDF of the Marksheet
+          </p>
+        </div>
+
+        {!previewUrl && (
+          <div 
+            className="max-w-2xl mx-auto bg-white border-2 border-dashed border-zinc-300 rounded-2xl p-12 text-center hover:bg-zinc-50 transition-colors cursor-pointer group"
+            onClick={() => fileInputRef.current?.click()}
+            onDrop={handleDrop}
+            onDragOver={handleDragOver}
+          >
+            <div className="w-16 h-16 bg-blue-50 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:scale-110 transition-transform">
+              <UploadCloud size={28} />
+            </div>
+            <h3 className="text-lg font-medium text-zinc-900 mb-2">Click to upload or drag and drop</h3>
+            <p className="text-sm text-zinc-500 mb-6">Supports JPG, PNG, WEBP, PDF</p>
+            <button className="px-6 py-2.5 bg-zinc-900 text-white rounded-lg font-medium hover:bg-zinc-800 transition-colors inline-flex items-center gap-2">
+               Select File
+            </button>
+            <input 
+              type="file" 
+              className="hidden" 
+              ref={fileInputRef} 
+              accept="image/*,application/pdf" 
+              multiple
+              onChange={handleFileChange}
+            />
+          </div>
+        )}
+
+        {previewUrl && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+            <div className="lg:col-span-4 space-y-4">
+              <div className="bg-white rounded-2xl border border-zinc-200 overflow-hidden shadow-sm">
+                <div className="p-4 border-b border-zinc-100 flex items-center justify-between bg-zinc-50/50">
+                  <span className="font-medium flex items-center gap-2 text-sm text-zinc-700">
+                    <FileImage size={16} className="text-zinc-400" />
+                    {files.length > 1 ? `Batch Processed (${files.length} items)` : (files[0]?.type === 'application/pdf' ? 'Original Document' : 'Original Image')}
+                  </span>
+                  <button 
+                    onClick={() => {
+                      setPreviewUrl(null);
+                      setFiles([]);
+                      setData(null);
+                      setError(null);
+                      if (fileInputRef.current) fileInputRef.current.value = "";
+                    }}
+                    className="text-xs font-medium text-blue-600 hover:text-blue-700"
+                  >
+                    Upload New
+                  </button>
+                </div>
+                <div className="p-0 bg-zinc-100 flex items-center justify-center min-h-[400px] overflow-hidden relative">
+                  <TransformWrapper initialScale={1} minScale={0.5} maxScale={5} centerOnInit>
+                    {({ zoomIn, zoomOut, resetTransform }) => (
+                      <>
+                        <div className="absolute top-4 right-4 z-10 flex flex-col gap-2 bg-white/90 p-1.5 rounded-lg shadow-md border border-zinc-200">
+                          <button onClick={() => zoomIn()} className="p-1.5 text-zinc-600 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors" title="Zoom In">
+                            <ZoomIn size={18} />
+                          </button>
+                          <button onClick={() => zoomOut()} className="p-1.5 text-zinc-600 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors" title="Zoom Out">
+                            <ZoomOut size={18} />
+                          </button>
+                          <button onClick={() => resetTransform()} className="p-1.5 text-zinc-600 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors" title="Reset Zoom">
+                            <Maximize size={18} />
+                          </button>
+                        </div>
+                        <TransformComponent wrapperClass="w-full h-full min-h-[400px] cursor-grab active:cursor-grabbing" contentClass="w-full h-full flex items-center justify-center">
+                          {files[0]?.type === 'application/pdf' ? (
+                            <div className="w-full flex-col items-center flex gap-4 p-4">
+                              <Document 
+                                file={previewUrl} 
+                                onLoadSuccess={({ numPages }) => setNumPages(numPages)}
+                                loading={<p className="text-sm text-zinc-500 py-10">Loading PDF document...</p>}
+                                className="flex flex-col items-center gap-4"
+                              >
+                                {Array.from(new Array(numPages || 0), (el, index) => (
+                                   <div key={`page_${index + 1}`} className="shadow-md rounded overflow-hidden bg-white">
+                                     <Page 
+                                       pageNumber={index + 1} 
+                                       renderTextLayer={false} 
+                                       renderAnnotationLayer={false} 
+                                       width={320}
+                                     />
+                                   </div>
+                                ))}
+                              </Document>
+                            </div>
+                          ) : (
+                            <div className="p-4 flex items-center justify-center">
+                              <img 
+                                 src={previewUrl!} 
+                                 alt="Marksheet preview" 
+                                 className="max-w-full max-h-[500px] rounded shadow-sm select-none"
+                                 referrerPolicy="no-referrer"
+                                 draggable={false}
+                              />
+                            </div>
+                          )}
+                        </TransformComponent>
+                      </>
+                    )}
+                  </TransformWrapper>
+                </div>
+              </div>
+            </div>
+
+            <div className="lg:col-span-8">
+              {isProcessing && (
+                <div className="bg-white rounded-2xl border border-zinc-200 border-dashed p-16 flex flex-col items-center justify-center text-center space-y-4 h-full min-h-[400px]">
+                  <Loader2 size={32} className="animate-spin text-blue-600" />
+                  <p className="text-zinc-600 font-medium">Scanning marksheet & extracting grades...</p>
+                  <p className="text-sm text-zinc-400 max-w-sm">This can take a few moments depending on the complexity of the marksheet.</p>
+                </div>
+              )}
+
+              {error && (
+                <div className="bg-red-50 border border-red-200 rounded-2xl p-6 flex flex-col items-center justify-center space-y-4 text-center">
+                  <div className="w-12 h-12 bg-red-100 text-red-600 rounded-full flex items-center justify-center">
+                    <AlertCircle size={24} />
+                  </div>
+                  <div>
+                     <h3 className="text-red-900 font-medium mb-1">Could not extract data</h3>
+                     <p className="text-red-700 text-sm max-w-md">{error}</p>
+                  </div>
+                  <button 
+                    onClick={() => files.length > 0 && processFiles(files)}
+                    className="px-4 py-2 bg-red-100 hover:bg-red-200 text-red-700 font-medium rounded-lg text-sm transition-colors mt-2"
+                  >
+                    Try Again
+                  </button>
+                </div>
+              )}
+
+              {data && (
+                <div className="bg-white rounded-2xl border border-zinc-200 shadow-sm overflow-hidden">
+                  <div className="p-5 border-b border-zinc-100 flex items-center justify-between flex-wrap gap-4">
+                     <div className="flex items-center gap-3">
+                       <h3 className="font-semibold text-zinc-900 flex items-center gap-2">
+                          <TableIcon size={18} className="text-blue-600" />
+                          Extracted Results
+                       </h3>
+                       <span className="text-xs font-medium px-2.5 py-1 bg-green-100 text-green-700 rounded-full">
+                          {data.length} student{data.length !== 1 ? 's' : ''} found
+                       </span>
+                     </div>
+                     <div className="flex items-center gap-2">
+                        <button 
+                          onClick={exportToCSV}
+                          className="px-3 py-1.5 bg-white border border-zinc-200 hover:bg-zinc-50 text-sm font-medium text-zinc-700 rounded-md transition-colors flex items-center gap-1.5 shadow-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                        >
+                          <Download size={14} />
+                          CSV
+                        </button>
+                     </div>
+                  </div>
+                  
+                  {data.length === 0 ? (
+                    <div className="p-12 text-center text-zinc-500">
+                      No students or grades could be found in this image.
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse min-w-[600px]">
+                        <thead>
+                          <tr className="bg-zinc-50 border-b border-zinc-200 text-xs uppercase tracking-wider text-zinc-500 font-medium">
+                            <th className="py-3 px-5 border-r border-zinc-200 min-w-48 sticky left-0 bg-zinc-50 shadow-[1px_0_0_0_rgb(228_228_231)] z-10">Student Name</th>
+                            <th className="py-3 px-5 whitespace-nowrap">Roll Number</th>
+                            <th className="py-3 px-5 whitespace-nowrap">Year</th>
+                            <th className="py-3 px-5 whitespace-nowrap min-w-48">State Board</th>
+                            {allSubjects.map((subject, idx) => (
+                              <th key={idx} className="py-3 px-5 whitespace-nowrap">
+                                <div>{subject}</div>
+                                {subjectCodes[subject] && (
+                                  <div className="text-[10px] text-zinc-400 normal-case tracking-normal mt-0.5">
+                                    {subjectCodes[subject]}
+                                  </div>
+                                )}
+                              </th>
+                            ))}
+                            <th className="py-3 px-5 whitespace-nowrap">Total Marks</th>
+                            <th className="py-3 px-5 whitespace-nowrap">Percentage</th>
+                            <th className="py-3 px-5 whitespace-nowrap">Result</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-zinc-100 text-sm">
+                           {data.map((student, idx) => (
+                            <tr key={idx} className="hover:bg-zinc-50/50 transition-colors group">
+                              <td className="p-0 border-r border-zinc-100 sticky left-0 bg-white shadow-[1px_0_0_0_rgb(244_244_245)] z-10">
+                                <input 
+                                  value={student.studentName || ''}
+                                  onChange={(e) => handleCellChange(idx, 'studentName', e.target.value)}
+                                  placeholder="-"
+                                  className="w-full h-full py-3 px-5 bg-transparent border-[1.5px] border-transparent focus:border-blue-500 focus:bg-white focus:ring-4 focus:ring-blue-100 font-medium text-zinc-900 outline-none transition-all"
+                                />
+                              </td>
+                              <td className="p-0">
+                                <input 
+                                  value={student.rollNumber || ''}
+                                  onChange={(e) => handleCellChange(idx, 'rollNumber', e.target.value)}
+                                  placeholder="-"
+                                  className="w-full h-full py-3 px-5 bg-transparent border-[1.5px] border-transparent focus:border-blue-500 focus:bg-white focus:ring-4 focus:ring-blue-100 text-zinc-600 outline-none transition-all"
+                                />
+                              </td>
+                              <td className="p-0 whitespace-nowrap">
+                                <input 
+                                  value={student.yearOfExam || ''}
+                                  onChange={(e) => handleCellChange(idx, 'yearOfExam', e.target.value)}
+                                  placeholder="-"
+                                  className="w-full h-full py-3 px-5 bg-transparent border-[1.5px] border-transparent focus:border-blue-500 focus:bg-white focus:ring-4 focus:ring-blue-100 text-zinc-600 outline-none transition-all"
+                                />
+                              </td>
+                              <td className="p-0">
+                                <input 
+                                  value={student.stateBoard || ''}
+                                  onChange={(e) => handleCellChange(idx, 'stateBoard', e.target.value)}
+                                  placeholder="-"
+                                  className="w-full h-full py-3 px-5 bg-transparent border-[1.5px] border-transparent focus:border-blue-500 focus:bg-white focus:ring-4 focus:ring-blue-100 text-zinc-600 outline-none transition-all"
+                                />
+                              </td>
+                              {allSubjects.map((subject, subIdx) => {
+                                const gradeObj = student.subjects?.find(s => s.subjectName === subject);
+                                return (
+                                  <td key={subIdx} className="p-0">
+                                    <div className="h-full w-full py-2 px-3">
+                                      <input 
+                                        value={gradeObj?.grade || ''}
+                                        onChange={(e) => handleSubjectChange(idx, subject, e.target.value)}
+                                        placeholder="-"
+                                        className="w-full min-w-[80px] py-1 px-2 rounded bg-zinc-100 text-zinc-900 border-[1.5px] border-transparent font-medium focus:border-blue-500 focus:bg-white focus:ring-4 focus:ring-blue-100 outline-none transition-all text-center"
+                                      />
+                                    </div>
+                                  </td>
+                                );
+                              })}
+                              <td className="p-0">
+                                <input 
+                                  value={student.totalMarksObtained || ''}
+                                  onChange={(e) => handleCellChange(idx, 'totalMarksObtained', e.target.value)}
+                                  placeholder="-"
+                                  className="w-full h-full py-3 px-5 bg-transparent border-[1.5px] border-transparent font-medium text-zinc-900 outline-none transition-all focus:border-blue-500 focus:bg-white focus:ring-4 focus:ring-blue-100"
+                                />
+                              </td>
+                              <td className="p-0">
+                                <div className="h-full w-full py-2 px-3">
+                                  <input 
+                                    value={student.percentage ? student.percentage.replace('%', '') : ''}
+                                    onChange={(e) => handleCellChange(idx, 'percentage', e.target.value ? `${e.target.value}%` : '')}
+                                    placeholder="-"
+                                    className="w-full min-w-[60px] py-1 px-2 rounded bg-blue-50 text-blue-800 border-[1.5px] border-transparent font-medium focus:border-blue-500 focus:bg-white focus:ring-4 focus:ring-blue-100 outline-none transition-all text-center"
+                                  />
+                                </div>
+                              </td>
+                              <td className="p-0">
+                                <div className="h-full w-full py-2 px-3">
+                                  <select 
+                                    value={student.result || ''}
+                                    onChange={(e) => handleCellChange(idx, 'result', e.target.value)}
+                                    className={`w-full py-1 px-2 rounded border-[1.5px] border-transparent font-medium outline-none transition-all appearance-none cursor-pointer focus:border-blue-500 focus:bg-white focus:ring-4 focus:ring-blue-100 ${
+                                      student.result === 'Pass' ? 'text-green-800 bg-green-100' : 
+                                      student.result === 'Fail' ? 'text-red-800 bg-red-100' : 
+                                      'text-zinc-800 bg-zinc-100'
+                                    }`}
+                                  >
+                                    <option value="">-</option>
+                                    <option value="Pass">Pass</option>
+                                    <option value="Fail">Fail</option>
+                                    <option value="Promoted">Promoted</option>
+                                  </select>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function preprocessImage(file: File, maxWidth = 1600, maxHeight = 1600, quality = 0.8): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target?.result as string;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > maxWidth) {
+            height = Math.round((height * maxWidth) / width);
+            width = maxWidth;
+          }
+        } else {
+          if (height > maxHeight) {
+            width = Math.round((width * maxHeight) / height);
+            height = maxHeight;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error("Failed to get canvas text"));
+          return;
+        }
+
+        // Fill background with white in case of transparent PNG/WEBP
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        // Enhance contrast slightly using composite operation (optional, helpful for faded scans)
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // Convert to optimal JPEG to save tokens and speed up API
+        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        resolve(dataUrl);
+      };
+      img.onerror = (error) => reject(error);
+    };
+    reader.onerror = (error) => reject(error);
+  });
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = (error) => reject(error);
+  });
+}
+
